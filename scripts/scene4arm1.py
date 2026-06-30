@@ -34,6 +34,11 @@ parser = argparse.ArgumentParser()
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
+# Force offscreen camera rendering ON. This is what lets the top-down camera produce
+# frames, and it is SEPARATE from the interactive GLFW window (which fails on this
+# headless launchable). So the camera works even though no live window opens.
+args_cli.enable_cameras = True
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -42,6 +47,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.utils import configclass
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.managers import SceneEntityCfg
@@ -227,6 +233,27 @@ class SceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(FRAG_XY[0], FRAG_XY[1], FRAG_CENTER_Z)),
+    )
+
+    # Top-down camera, 5 m above the table centre, looking straight down. This is the
+    # view the VLM condition reads. data_types=["rgb"] gives a colour image; the lens
+    # (focal_length) is set so the TABLE fills the frame, and 1024x1024 gives enough
+    # detail for the model to resolve the small objects and their appearance.
+    table_cam = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/table_cam",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.0, 0.0, 5.0),
+            rot=(0.7071, 0.0, 0.7071, 0.0),   # look straight down (world convention)
+            convention="world",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=28.0,                # longer lens -> tighter view, table fills frame
+            focus_distance=400.0,
+            horizontal_aperture=20.955, clipping_range=(0.1, 20.0),
+        ),
+        width=1024,
+        height=1024,
     )
 
 
@@ -541,6 +568,52 @@ def hold_viewer(sim, scene, arms):
             arm._update_carried()
 
 
+def capture_top_view(scene, sim, path=None, warmup=15):
+    """Render the top-down camera and save one RGB frame to a PNG file.
+
+    Renders a few warmup steps first so the image is valid (the first frames after a
+    scene change can be blank), then reads the camera's rgb output, converts it to a
+    uint8 image, and saves it. Returns the path written.
+
+    This both proves the camera works and gives you a way to SEE the scene, since the
+    live GLFW window cannot open on this headless launchable. It is also the exact
+    frame the VLM condition will send to the model.
+    """
+    import numpy as np
+
+    sim_dt = sim.get_physics_dt()
+    for _ in range(warmup):
+        scene.write_data_to_sim()
+        sim.step(render=True)
+        scene.update(sim_dt)
+
+    cam = scene["table_cam"]
+    rgb = cam.data.output["rgb"][0]            # (H, W, 3 or 4)
+    arr = rgb.detach().cpu().numpy()
+    if arr.shape[-1] == 4:                      # drop alpha if present
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:                   # floats in [0,1] -> 0..255
+        arr = (arr * 255).clip(0, 255).astype(np.uint8) if arr.max() <= 1.0 \
+            else arr.astype(np.uint8)
+
+    if path is None:
+        import os
+        from datetime import datetime
+        os.makedirs("captures", exist_ok=True)
+        path = os.path.join("captures", f"table_{datetime.now():%Y%m%d_%H%M%S}.png")
+
+    try:
+        from PIL import Image
+        Image.fromarray(arr).save(path)
+        print(f"[CAMERA] saved top-down frame to {path}  (shape {arr.shape})")
+    except Exception as e:
+        np.save(path.replace(".png", ".npy"), arr)
+        print(f"[CAMERA] PIL not available ({e}); saved raw array to "
+              f"{path.replace('.png', '.npy')}  (shape {arr.shape})")
+        path = path.replace(".png", ".npy")
+    return path
+
+
 def place_objects(scene, sim, start_positions):
     """Move objects to given (x, y) start positions after the scene is built.
 
@@ -592,9 +665,6 @@ def run_plan(plan, scene, sim, arms_by_name, label_to_key, task_locations):
 
         print(f"\n[STEP {step.id}] {step.arm} moves {step.object_name} "
               f"({obj_key}) -> {step.place_at}   reason: {step.reason}")
-        print(f"  pick_xy=({pick_xy[0]:+.2f}, {pick_xy[1]:+.2f}) "
-              f"obj_center_z={obj_center_z:.3f}  drop_xy=({drop_xy[0]:+.2f}, {drop_xy[1]:+.2f}) "
-              f"grasp_z={arm.grasp_z(obj_center_z):.3f}")
         pick_and_place(arm, obj_key, pick_xy, obj_center_z, drop_xy, HOVER_Z,
                        f"{step.id} {step.arm}->{step.place_at}")
         arm.go_home()
@@ -654,12 +724,14 @@ def run_block_relay(sim, scene, arms):
 
 
 # ============================ PART 5: MAIN ==================================
-# Two run modes. Set MODE below:
+# Run modes. Set MODE below:
+#   "camera"  -> spawn, settle, place the block, and save ONE top-down frame to a
+#                file (proves the camera works; gives you an image to look at).
 #   "motion"  -> spawn, settle, and move each arm in and back (apparatus check).
 #   "relay"   -> spawn, settle, then ask Qwen for a plan to relay a block across the
 #                table and execute it (the text-instruction pipeline, end to end).
 
-MODE = "relay"
+MODE = "camera"
 
 
 def motion_test(sim, scene, arms):
@@ -698,7 +770,14 @@ def main():
         print(f"  {name:9s} {type(a).__name__:16s} base=({float(base[0]):+.2f}, "
               f"{float(base[1]):+.2f})  reach={a.REACH}")
 
-    if MODE == "motion":
+    if MODE == "camera":
+        print("\n=== Camera test: place both objects in the open and save a frame ===")
+        # Put the two objects in clear, non-occluded spots, apart from each other, so
+        # you can confirm BOTH are visible from above AND that the fragile-look object
+        # (icy cyan, glassy) is distinguishable from the robust cube (solid blue).
+        place_objects(scene, sim, {"cube": (-0.45, 0.30), "fragile": (0.45, -0.30)})
+        capture_top_view(scene, sim)
+    elif MODE == "motion":
         print("\n=== Motion test: each arm reaches in and back, one at a time ===")
         motion_test(sim, scene, arms)
     elif MODE == "relay":
