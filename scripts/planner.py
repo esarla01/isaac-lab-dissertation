@@ -144,6 +144,14 @@ def read_plan_from_reply(reply: str, state) -> Plan:
             reason=str(item.get("reason", "")),
         ))
     plan = Plan(steps=steps, made_by="text_llm", model_reply=reply)
+
+    print("[PLANNER 3/4] PARSED PLAN (before checks):")
+    if not steps:
+        print("  (no steps parsed!)")
+    for s in steps:
+        dep = f" depends_on={s.depends_on}" if s.depends_on else ""
+        print(f"  {s.id}: {s.arm} moves {s.object_name} -> {s.place_at}{dep}  ({s.reason})")
+
     check_plan(plan, state)              # raises PlannerError if anything is wrong
     return plan
 
@@ -194,20 +202,27 @@ def check_plan(plan: Plan, state) -> None:
     # it down. Each object starts at its scene position.
     object_pos = {label: obj.position for label, obj in objects.items()}
     by_id = {s.id: s for s in plan.steps}
+    print(f"[PLANNER 4/4] CHECKING PLAN (execution order: {order})")
     for sid in order:
         s = by_id[sid]
         arm = arms[s.arm]
         pick_pos = object_pos[s.object_name]      # wherever the object is right now
         drop_pos = places[s.place_at]
-        if _planar_distance(arm.base_position, pick_pos) > arm.reach:
+        pick_d = _planar_distance(arm.base_position, pick_pos)
+        drop_d = _planar_distance(arm.base_position, drop_pos)
+        print(f"  {s.id}: {s.arm} (reach={arm.reach:.2f}) "
+              f"pick {s.object_name}@{tuple(round(v,2) for v in pick_pos)} dist={pick_d:.2f} -> "
+              f"drop {s.place_at}@{tuple(round(v,2) for v in drop_pos)} dist={drop_d:.2f}")
+        if pick_d > arm.reach:
             raise PlannerError(
                 f"step {s.id}: {s.arm} cannot reach object {s.object_name} "
                 f"at {tuple(round(v,2) for v in pick_pos)}")
-        if _planar_distance(arm.base_position, drop_pos) > arm.reach:
+        if drop_d > arm.reach:
             raise PlannerError(
                 f"step {s.id}: {s.arm} cannot reach location {s.place_at} "
                 f"at {tuple(round(v,2) for v in drop_pos)}")
         object_pos[s.object_name] = drop_pos      # object is now at the drop location
+    print("[PLANNER 4/4] all checks passed.")
 
 
 def _order_by_dependencies(steps) -> List[str]:
@@ -237,10 +252,25 @@ def make_plan(state) -> Plan:
     guessing, so a bad attempt is always visible and can be retried.
     """
     messages = write_prompt(state)
+
+    print("\n" + "=" * 68)
+    print("[PLANNER 1/4] PROMPT SENT TO MODEL")
+    print(f"  endpoint={QWEN_ENDPOINT}  model={QWEN_MODEL}")
+    print("=" * 68)
+    for m in messages:
+        print(f"[{m['role']}]\n{m['content']}\n")
+
+    print("=" * 68)
+    print("[PLANNER 2/4] CALLING MODEL ...")
+    print("=" * 68)
     try:
         reply = ask_model(messages)
     except Exception as e:
         raise PlannerError(f"the model call failed: {e}") from e
+    print("[PLANNER 2/4] RAW MODEL REPLY:")
+    print(reply)
+    print("=" * 68)
+
     return read_plan_from_reply(reply, state)   # raises PlannerError if the plan is bad
 
 

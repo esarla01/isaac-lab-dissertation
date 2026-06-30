@@ -541,9 +541,126 @@ def hold_viewer(sim, scene, arms):
             arm._update_carried()
 
 
+def place_objects(scene, sim, start_positions):
+    """Move objects to given (x, y) start positions after the scene is built.
+
+    start_positions: dict scene_key -> (x, y). Each object is written to that x, y at
+    resting height, zero velocity, then the scene is settled briefly so read-back
+    positions are accurate. Runtime placement keeps the scene flexible.
+    """
+    for key, xy in start_positions.items():
+        obj = scene[key]
+        rest_z = TABLE_H + CUBE_SIZE / 2
+        pose = torch.tensor([[xy[0], xy[1], rest_z, 1.0, 0.0, 0.0, 0.0]],
+                            device=sim.device, dtype=torch.float32)
+        obj.write_root_pose_to_sim(pose)
+        obj.write_root_velocity_to_sim(torch.zeros((1, 6), device=sim.device))
+    sim_dt = sim.get_physics_dt()
+    for c in range(60):
+        scene.write_data_to_sim()
+        sim.step(render=(c % 3 == 0))
+        scene.update(sim_dt)
+
+
+def run_plan(plan, scene, sim, arms_by_name, label_to_key, task_locations):
+    """Carry out a plan step by step, in dependency order (four-arm capable).
+
+    For each step: find the arm and the real object, settle and re-read the object's
+    true position (so a relay's later leg picks up where the earlier leg left it),
+    and run a pick-and-place to the step's destination. Steps run one at a time, so
+    the four arms never collide. task_locations resolves a step's place_at name to xy.
+    """
+    from planner import ordered_steps
+
+    def settle_scene(steps=60):
+        for _ in range(steps):
+            scene.write_data_to_sim()
+            sim.step(render=True)
+            scene.update(sim.get_physics_dt())
+
+    for step in ordered_steps(plan):
+        arm = arms_by_name[step.arm]
+        obj_key = label_to_key[step.object_name]
+
+        settle_scene()
+        here = scene[obj_key].data.root_pos_w[0]
+        pick_xy = (float(here[0]), float(here[1]))
+        obj_center_z = float(here[2])
+
+        dest = task_locations[step.place_at]
+        drop_xy = (dest[0], dest[1])
+
+        print(f"\n[STEP {step.id}] {step.arm} moves {step.object_name} "
+              f"({obj_key}) -> {step.place_at}   reason: {step.reason}")
+        print(f"  pick_xy=({pick_xy[0]:+.2f}, {pick_xy[1]:+.2f}) "
+              f"obj_center_z={obj_center_z:.3f}  drop_xy=({drop_xy[0]:+.2f}, {drop_xy[1]:+.2f}) "
+              f"grasp_z={arm.grasp_z(obj_center_z):.3f}")
+        pick_and_place(arm, obj_key, pick_xy, obj_center_z, drop_xy, HOVER_Z,
+                       f"{step.id} {step.arm}->{step.place_at}")
+        arm.go_home()
+
+
+# --- The first four-arm task: move one block across the table by relay. ---
+# The block starts near the WEST UR and must reach a zone near the EAST UR. No single
+# arm spans that distance, so the model must use the central relay: one arm to the
+# centre, another arm onward. Locations are chosen so the task genuinely needs a
+# handoff (start and destination are beyond any one arm's reach of each other).
+_CZ = TABLE_H + CUBE_SIZE / 2
+BLOCK_START = (-1.00, 0.0)               # near the west UR
+TASK_LOCATIONS = {
+    "relay":     (0.0, 0.0, _CZ),        # central point all four arms reach
+    "east_zone": (1.00, 0.0, _CZ),       # near the east UR, far from the west UR
+}
+
+
+def run_block_relay(sim, scene, arms):
+    """Build the symbolic state, ask Qwen for a plan, and execute it (text loop).
+
+    This is the first end-to-end run of the text-instruction pipeline on four arms:
+    state -> planner (live Qwen) -> execution. No image yet; that is the next step.
+    """
+    import state as state_mod
+    from planner import make_plan, PlannerError, ordered_steps
+
+    # Put the block at its start (the fragile look-alike is parked out of the way).
+    place_objects(scene, sim, {"cube": BLOCK_START, "fragile": (0.0, 0.55)})
+
+    # Symbolic state over all four arms, the block, and the task's named locations.
+    object_specs = {
+        "cube":    {"mass": 0.05, "footprint": 0.05},
+        "fragile": {"mass": 0.05, "footprint": 0.05},
+    }
+    world, label_to_key = state_mod.build_symbolic_state(
+        scene, list(arms.values()), object_specs,
+        goal="Move the block to east_zone.",
+        locations=TASK_LOCATIONS,
+    )
+    print("\nlabel -> real object:", label_to_key)
+    print("arms the model sees:", [a.name for a in world.arms])
+
+    # Ask the live model for a plan; fail loudly if it is unreachable or nonsensical.
+    try:
+        plan = make_plan(world)
+    except PlannerError as e:
+        print(f"\n[PLANNER] no usable plan: {e}")
+        return
+
+    print("\n=== MODEL PLAN ===")
+    for s in ordered_steps(plan):
+        dep = f" after {s.depends_on}" if s.depends_on else ""
+        print(f"  {s.id}: {s.arm} moves {s.object_name} -> {s.place_at}{dep}  ({s.reason})")
+
+    run_plan(plan, scene, sim, arms, label_to_key, TASK_LOCATIONS)
+
+
 # ============================ PART 5: MAIN ==================================
-# First four-arm step: spawn the arms, settle them, and hold the viewer so you can
-# see all four standing one per edge. Task logic comes next.
+# Two run modes. Set MODE below:
+#   "motion"  -> spawn, settle, and move each arm in and back (apparatus check).
+#   "relay"   -> spawn, settle, then ask Qwen for a plan to relay a block across the
+#                table and execute it (the text-instruction pipeline, end to end).
+
+MODE = "relay"
+
 
 def motion_test(sim, scene, arms):
     """Move each arm, one at a time, to a point in front of it and back.
@@ -581,10 +698,14 @@ def main():
         print(f"  {name:9s} {type(a).__name__:16s} base=({float(base[0]):+.2f}, "
               f"{float(base[1]):+.2f})  reach={a.REACH}")
 
-    print("\n=== Motion test: each arm reaches in and back, one at a time ===")
-    motion_test(sim, scene, arms)
-    print("\nMotion test done. Watch for clean reaches, especially the two Frankas "
-          "(north/south) which face sideways.\n")
+    if MODE == "motion":
+        print("\n=== Motion test: each arm reaches in and back, one at a time ===")
+        motion_test(sim, scene, arms)
+    elif MODE == "relay":
+        print("\n=== Block relay: Qwen plans, the arms execute ===")
+        run_block_relay(sim, scene, arms)
+    else:
+        print(f"unknown MODE {MODE!r}")
 
     hold_viewer(sim, scene, list(arms.values()))
     simulation_app.close()

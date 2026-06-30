@@ -1,29 +1,53 @@
-"""Two-arm tabletop manipulation in Isaac Lab 2.3.2.
+"""Two-arm tabletop manipulation in Isaac Lab (the execution layer).
 
-A Franka Panda and a UR10e (with a Robotiq 2F-85 gripper) face each other across a
-table. Each arm picks and lifts one object: the Franka takes the cube, the UR takes
-the tall fragile cylinder on its own side.
+A Franka Panda and a UR10e (with a Robotiq gripper) face each other across a table.
+This file is the EXECUTION layer: given a plan it carries it out in simulation. The
+headline behaviour is a RELAY: the Franka picks the cube up at a corner on its side,
+sets it down at a shared centre point, and the UR then picks it up from there and
+carries it to the opposite corner on its side.
 
-Design notes that explain non-obvious choices in this file:
+Environment note: this runs on an Isaac Lab 2.3.0 launchable (isaaclab_assets 0.2.3),
+which ships the UR10e with a Robotiq 2F-140 gripper (UR10e_ROBOTIQ_GRIPPER_CFG), not
+the 2F-85 the project originally targeted. The import below prefers the 2F-85 name and
+falls back to the 2F-140. Because grasping here is KINEMATIC, the exact gripper does
+not affect whether a pick succeeds.
 
-* IK runs through Isaac Lab's DifferentialIKController. The one subtlety that caused
-  real trouble is that PhysX returns the Jacobian in the WORLD frame while the IK
-  command is in the robot BASE frame. They must agree, so the Jacobian is rotated
-  into the base frame before use (see ArmController._jacobian_b). This is a no-op for
-  the Franka (its base is unrotated) but essential for the UR (its base is yawed 180
-  degrees to face the Franka).
+================================ HOW TO READ THIS FILE ========================
+The file goes top to bottom from configuration, to one arm, to the whole demo:
+
+  1. CONFIG (constants)        table, object, arm, and motion parameters; the named
+                              LOCATIONS a plan can target (relay point + corners).
+  2. SCENE (make_ur_cfg,       the Isaac Lab scene description: table, both arms,
+     SceneCfg)                 the cube and the look-alike fragile cube.
+  3. ARM CONTROL               ArmController (shared IK + grasp logic) and the two
+     (ArmController, Franka-    per-arm subclasses that fill in gripper details and
+     Controller, URController)  capability specs.
+  4. RUNTIME HELPERS           build_world, settle, fragility_check, pick_and_place,
+                              go_home, hold_viewer.
+  5. run_plan + main           run_plan executes a plan step by step in dependency
+                              order; main builds the state, makes a relay plan,
+                              checks it, and runs it.
+
+Two design choices explain most of the non-obvious code:
+
+* IK runs through Isaac Lab's DifferentialIKController. The subtlety that caused real
+  trouble: PhysX returns the Jacobian in the WORLD frame while the IK command is in
+  the robot BASE frame. They must agree, so the Jacobian is rotated into the base
+  frame before use (see ArmController._jacobian_b). This is a no-op for the Franka
+  (base unrotated) but essential for the UR (base yawed 180 degrees to face it).
 
 * Grasping is KINEMATIC, not contact-based. When an arm "grasps", the object is
   locked to the hand and follows it rigidly until release (see attach / detach /
   _update_carried). This is deliberate: the research contribution is task allocation
   and visual grounding, not grasp dynamics, so the execution layer is held constant
-  and made perfectly reliable rather than tuned against PhysX contact physics. The
-  fragility check in the experiment is a modelled force-threshold decision computed
-  separately, so kinematic grasping does not affect it.
+  and made reliable rather than tuned against contact physics. The experiment's
+  fragility check is a modelled force-threshold decision computed separately, so
+  kinematic grasping does not affect it.
+==============================================================================
 
 Run:
-    python scripts/scene.py            # windowed
-    python scripts/scene.py --headless # no GUI
+    python scene.py            # windowed
+    python scene.py --headless # no GUI
 """
 
 import argparse
@@ -53,16 +77,27 @@ from isaaclab.utils.math import (
     quat_inv,
 )
 
+from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
+
+# This Isaac Lab build (isaaclab_assets 0.2.3) ships the UR10e with a Robotiq 2F-140
+# gripper as UR10e_ROBOTIQ_GRIPPER_CFG, not the 2F-85 the script was written against.
+# The actuator groups this file tweaks (shoulder/elbow/wrist, gripper_drive,
+# gripper_finger) and the finger_joint driver all match, so it is a drop-in alias.
+# Prefer the 2F-85 name where it exists; fall back to the 2F-140 otherwise.
 try:
-    from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG, UR10e_ROBOTIQ_2F_85_CFG
+    from isaaclab_assets import UR10e_ROBOTIQ_2F_85_CFG
 except ImportError:
-    from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
-    from isaaclab_assets.robots.universal_robots import UR10e_ROBOTIQ_2F_85_CFG
+    try:
+        from isaaclab_assets.robots.universal_robots import UR10e_ROBOTIQ_2F_85_CFG
+    except ImportError:
+        from isaaclab_assets.robots.universal_robots import (
+            UR10e_ROBOTIQ_GRIPPER_CFG as UR10e_ROBOTIQ_2F_85_CFG,
+        )
 
 
-# ============================================================================
-# Configuration constants
-# ============================================================================
+# ============================ PART 1: CONFIG ================================
+# Table, object, arm, and motion parameters, plus the named LOCATIONS a plan can
+# target. Changing the scene mostly means changing values here.
 
 # --- Table geometry. The work surface sits at TABLE_H; legs derive from it, so
 #     changing the top size or height automatically repositions the legs. ---
@@ -81,18 +116,16 @@ FRANKA_BASE = (-0.55, 0.0, TABLE_H)
 UR_BASE = (0.75, 0.0, TABLE_H)
 UR_FACING_QUAT = (0.0, 0.0, 0.0, 1.0)  # (w,x,y,z): 180 deg about z
 
-# --- Objects. Each sits on its own side of the table so the arms never contest
-#     the same target. The cube is the Franka's; the tall cylinder is the UR's and
-#     its slim profile is the visual fragility cue. ---
+# --- Objects. The cube is the robust object; the fragile object is a same-size,
+#     same-mass GLASS-LIKE cube whose appearance (not its shape or mass) is the only
+#     fragility cue. Both sit flat and stable when placed. ---
 CUBE_XY = (-0.95, -0.40)             # start corner, near the Franka
 CUBE_SIZE = 0.05
 CUBE_CENTER_Z = TABLE_H + CUBE_SIZE / 2
-CUBE_DROP_XY = (-0.20, -0.22)        # place target on the Franka's side
 
 FRAG_XY = (0.0, 0.22)
 FRAG_SIZE = 0.05                     # same footprint as the cube, so it sits stably
 FRAG_CENTER_Z = TABLE_H + FRAG_SIZE / 2
-FRAG_DROP_XY = (0.20, 0.22)          # place target on the UR's side
 
 # --- Fragility model (modelled decision, NOT physics). Each arm applies a grip
 #     force; each object tolerates a maximum before it breaks. The check is a
@@ -125,6 +158,10 @@ SETTLE_STEPS = 90                    # steps to let the arms settle before the d
 VIEWER_HOLD_STEPS = 300              # steps to keep the window open at the end
 
 
+# ============================ PART 2: THE SCENE ==============================
+# The Isaac Lab description of the world: table, both arms, and the two objects
+# (the cube and the look-alike fragile cube).
+
 def make_ur_cfg():
     """Build the UR articulation config, matching Isaac Lab's reference arm gains.
 
@@ -154,10 +191,6 @@ def make_ur_cfg():
 
 UR_CFG = make_ur_cfg()
 
-
-# ============================================================================
-# Scene
-# ============================================================================
 
 def _leg(path, pos):
     """A single square table leg at the given world position."""
@@ -247,9 +280,10 @@ class SceneCfg(InteractiveSceneCfg):
     )
 
 
-# ============================================================================
-# Base arm controller
-# ============================================================================
+# ============================ PART 3: ARM CONTROL ============================
+# ArmController holds the shared IK + grasp logic; the two subclasses below fill in
+# each arm's gripper details and capability specs.
+
 class ArmController:
     """Shared differential-IK control and kinematic-grasp logic for one arm.
 
@@ -263,6 +297,7 @@ class ArmController:
     GRIP_OPEN = None       # gripper command for "open"
     GRIP_CLOSE = None      # gripper command for "closed"
     TOOL_OFFSET = None     # distance from the hand/tool frame to the fingertips (m)
+    HOME_ARM_POSE = None   # tucked stance between steps; None = default joint pose
 
     def __init__(self, name, scene, sim, arm_joint_expr, ee_body_name):
         self.name = name
@@ -367,6 +402,23 @@ class ArmController:
         state = "open" if grip > self.GRIP_CLOSE else "closed"
         print(f"[OK] {self.name} {label} (gripper -> {state})")
 
+    def go_home(self, steps=150, render=True):
+        """Return to the tucked home stance, clearing the shared centre for the next arm.
+
+        Called between plan steps so the arm that just acted is fully clear of the
+        shared centre before the next arm approaches (prevents the arms clashing).
+        """
+        if self.HOME_ARM_POSE is None:
+            home = self.robot.data.default_joint_pos[:, self.arm_ids]
+        else:
+            home = torch.tensor([self.HOME_ARM_POSE], device=self.device, dtype=torch.float32)
+        for _ in range(steps):
+            self.robot.set_joint_position_target(home, joint_ids=self.arm_ids)
+            self.set_gripper(self.GRIP_OPEN)
+            self.scene.write_data_to_sim()
+            self.sim.step(render=render)
+            self.scene.update(self.sim_dt)
+
     def grasp_z(self, obj_center_z):
         """Hand height at which the fingertips reach an object centred at obj_center_z."""
         return obj_center_z + self.TOOL_OFFSET
@@ -379,9 +431,7 @@ class ArmController:
         directly under the tool centre regardless of where the hand actually landed.
         This makes the grasp look clean and the placement precise even when the arm's
         hand arrives a centimetre or two off the object (the UR, at stretched poses,
-        tracks less tightly than the Franka). Gravity is disabled while carried, and
-        a few extra settle steps below let any contact from the descent die down
-        before the object is locked.
+        tracks less tightly than the Franka). Gravity is disabled while carried.
         """
         self._carried = obj
         hand = self.robot.data.body_state_w[:, self.ee_body, 0:7]
@@ -418,33 +468,9 @@ class ArmController:
         flags[:] = 1 if disabled else 0
         obj.root_physx_view.set_disable_gravities(flags, torch.arange(flags.shape[0]))
 
-    # Home stance the arm returns to between steps, to clear the shared centre.
-    # If None, the arm's default joint pose is used.
-    HOME_ARM_POSE = None
 
-    def go_home(self, steps=150, render=True):
-        """Move the arm back to its tucked home stance over its own side.
-
-        Called between plan steps so the arm that just acted is fully clear of the
-        shared centre before the next arm approaches (prevents the two arms clashing
-        at the relay point).
-        """
-        if self.HOME_ARM_POSE is None:
-            home = self.robot.data.default_joint_pos[:, self.arm_ids]
-        else:
-            home = torch.tensor([self.HOME_ARM_POSE], device=self.device, dtype=torch.float32)
-        for _ in range(steps):
-            self.robot.set_joint_position_target(home, joint_ids=self.arm_ids)
-            self.set_gripper(self.GRIP_OPEN)
-            self.scene.write_data_to_sim()
-            self.sim.step(render=render)
-            self.scene.update(self.sim_dt)
-
-
-# ============================================================================
-# Franka: parallel two-finger gripper
-# ============================================================================
 class FrankaController(ArmController):
+    """Franka Panda with a parallel two-finger gripper."""
     GRIP_OPEN = 0.04          # finger separation when open (m)
     GRIP_CLOSE = 0.0          # finger separation when closed (m)
     TOOL_OFFSET = 0.107       # panda_hand origin -> fingertip (m)
@@ -469,13 +495,16 @@ class FrankaController(ArmController):
         )
 
 
-# ============================================================================
-# UR10e: single Robotiq 2F-85 driver joint (mimic joints follow it)
-# ============================================================================
 class URController(ArmController):
+    """UR10e with a single Robotiq driver joint (the linkage mimic joints follow it).
+
+    Note: on this launchable the gripper is a Robotiq 2F-140 (see the import note at
+    the top); the 2F-85 numbers below still work because the grasp is kinematic. If
+    the UR's lift ever comes up short, raise TOOL_OFFSET.
+    """
     GRIP_OPEN = 0.0           # driver joint angle when open (rad)
     GRIP_CLOSE = 0.85         # driver joint angle when closed (rad)
-    TOOL_OFFSET = 0.18        # wrist_3_link -> 2F-85 fingertip (m)
+    TOOL_OFFSET = 0.18        # wrist_3_link -> Robotiq fingertip (m)
     GRIP_FORCE = 20.0         # modelled grip force (firmer industrial gripper)
     # --- Capability specs (legitimate symbolic dimensions for allocation) ---
     REACH = 1.30              # max reach radius (m), UR10e spec
@@ -519,9 +548,8 @@ class URController(ArmController):
         )
 
 
-# ============================================================================
-# Demo orchestration
-# ============================================================================
+# ============================ PART 4: RUNTIME HELPERS ========================
+# Building the world, settling it, the fragility check, and the motion primitives.
 
 def build_world():
     """Create the sim context, scene, camera, and both arm controllers."""
@@ -609,11 +637,7 @@ def pick_and_place(arm, obj_key, pick_xy, obj_center_z, drop_xy, lift_z, label):
 
 
 def hold_viewer(sim, scene, arms):
-    """Keep the window open at the end, keeping carried objects locked to their hands.
-
-    Carried objects are re-placed both before and after each step so they never drop
-    during the hold (the step loop here does not otherwise update them).
-    """
+    """Keep the window open at the end, keeping carried objects locked to their hands."""
     sim_dt = sim.get_physics_dt()
     for _ in range(VIEWER_HOLD_STEPS):
         for arm in arms:
@@ -624,6 +648,9 @@ def hold_viewer(sim, scene, arms):
         for arm in arms:
             arm._update_carried()
 
+
+# ============================ PART 5: RUN A PLAN =============================
+# Execute a plan step by step in dependency order, then the demo entry point.
 
 def run_plan(plan, scene, sim, arms_by_name, label_to_key):
     """Carry out a plan in simulation, step by step, in dependency order.
@@ -663,8 +690,7 @@ def run_plan(plan, scene, sim, arms_by_name, label_to_key):
         pick_and_place(arm, obj_key, pick_xy, obj_center_z, drop_xy, HOVER_Z,
                        f"{step.id} {step.arm}->{step.place_at}")
 
-        # Tuck this arm back to its own side before the next step runs, so the arm
-        # that just acted is clear of the shared centre when the next arm approaches.
+        # Tuck this arm back to its own side before the next step runs.
         arm.go_home()
 
 
@@ -675,8 +701,7 @@ def main():
 
     # Build the symbolic state so we get the private label->object map. The planner
     # works in neutral labels (object_1, ...); execution uses this map to act on the
-    # real scene objects. Locations are passed through so the planner could target
-    # them; here we drive execution from a hand-written plan (no model running yet).
+    # real scene objects.
     import state as state_mod
     object_specs = {
         "cube":    {"mass": 0.05, "footprint": 0.05},
