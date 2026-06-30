@@ -5,14 +5,14 @@ a named location. A step can depend on earlier steps ("do not start me until tho
 are done"), which is what lets a plan express a relay: arm A places an object at a
 shared point, then arm B (depending on A) carries it onward.
 
-This file reads the fragility-free scene from state.py, asks the local Qwen model for
+This file reads the fragility-free scene from state.py, asks the Qwen model for
 a plan, checks the plan makes sense, and hands it back. Execution runs the steps in
 dependency order.
 
 WHAT'S IN THIS FILE (in the order things happen):
   Step, Plan               - the result: ordered steps, with dependencies
   write_prompt(state)      - write the message we send the model
-  ask_model(messages)      - send it to Qwen and get the text reply back
+  ask_model(messages)      - send it to the Qwen endpoint and get the reply back
   read_plan_from_reply(..) - turn the reply into a checked Plan (or fail loudly)
   check_plan(plan, state)  - the safety checks (real names, no loops, reachable)
   make_plan(state)         - do all of the above; this is what you call
@@ -42,7 +42,9 @@ class PlannerError(Exception):
     reply made no sense). We raise instead of guessing, so a bad attempt is visible."""
 
 
-# ----- Where the local Qwen server lives (override with environment variables) -----
+# ----- Where the Qwen model lives. Set by environment variables. The endpoint can
+# be a local server (e.g. vLLM on localhost) OR a hosted OpenAI-compatible API
+# (e.g. Alibaba DashScope). The default below is a local server; override all three. -----
 QWEN_ENDPOINT = os.environ.get("QWEN_ENDPOINT", "http://localhost:8000/v1/chat/completions")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen2-VL-7B-Instruct")
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "EMPTY")     # local servers usually ignore this
@@ -77,12 +79,18 @@ class Plan:
     model_reply: Optional[str] = None     # the model's raw reply, kept for analysis
 
 
-def write_prompt(state) -> List[dict]:
+def write_prompt(state, image_b64: Optional[str] = None) -> List[dict]:
     """Write the message we send the model: describe the scene, ask for a plan.
 
     The scene (from state_to_code) lists arms, objects, and named locations, with no
     fragility. We explain that a plan is steps that may depend on each other, and that
     an object too far for one arm can be relayed via a shared location.
+
+    If image_b64 is given (a base64-encoded RGB frame), it is attached to the user
+    message as an image content block, and a sentence is added telling the model to
+    use what it SEES about the objects. This is the ONLY difference between the
+    text-only floor condition (image_b64=None) and the VLM condition: same model, same
+    text, with or without the image. So modality, not model, is the variable.
     """
     scene = state_to_code(state)
     objects = [o.label for o in state.objects]
@@ -98,21 +106,51 @@ def write_prompt(state) -> List[dict]:
         "there, and a second step (depending on the first) has another arm carry it "
         "onward. Reply with JSON only, no extra text."
     )
-    question = (
+    question_text = (
         f"{scene}\n\n"
         f"Objects: {objects}. Arms: {arms}. Locations: {places}.\n"
+    )
+    if image_b64 is not None:
+        # Explain how the picture relates to the labels, so the model can ground the
+        # neutral labels (object_1, ...) to what it sees by POSITION. The objects are
+        # labelled by position in the state, so position is the bridge between the
+        # text labels and the image.
+        question_text += (
+            "An overhead photo of the table is attached. The objects in the state are "
+            "labelled by their position; match each labelled object to what you see at "
+            "that position in the photo, and take its visible appearance into account "
+            "when you decide which arm should handle it.\n"
+        )
+    question_text += (
         "Produce a plan as a list of steps. Give each step an id like \"s1\". "
         "Use depends_on to list step ids that must finish first (empty if none).\n"
         "Reply in this exact JSON shape:\n"
         '{"plan": [{"id": "s1", "arm": "<arm>", "object": "<object>", '
         '"place_at": "<location>", "depends_on": [], "reason": "<short reason>"}]}'
     )
+
+    if image_b64 is None:
+        # Text-only floor: the content is a plain string.
+        user_content = question_text
+    else:
+        # VLM condition: the content is a list of blocks (image + text), the shape the
+        # OpenAI-compatible vision API expects.
+        user_content = [
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            {"type": "text", "text": question_text},
+        ]
+
     return [{"role": "system", "content": instructions},
-            {"role": "user", "content": question}]
+            {"role": "user", "content": user_content}]
 
 
 def ask_model(messages, max_tokens: int = 700) -> str:
-    """Send the messages to the local Qwen server and return its text reply."""
+    """Send the messages to the Qwen endpoint and return its text reply.
+
+    The endpoint is OpenAI-compatible, so this works against a local vLLM server
+    or a hosted API like DashScope; only the environment variables differ.
+    """
     if requests is None:
         raise PlannerError("the 'requests' package is needed to talk to the model")
     body = {"model": QWEN_MODEL, "messages": messages,
@@ -144,14 +182,6 @@ def read_plan_from_reply(reply: str, state) -> Plan:
             reason=str(item.get("reason", "")),
         ))
     plan = Plan(steps=steps, made_by="text_llm", model_reply=reply)
-
-    print("[PLANNER 3/4] PARSED PLAN (before checks):")
-    if not steps:
-        print("  (no steps parsed!)")
-    for s in steps:
-        dep = f" depends_on={s.depends_on}" if s.depends_on else ""
-        print(f"  {s.id}: {s.arm} moves {s.object_name} -> {s.place_at}{dep}  ({s.reason})")
-
     check_plan(plan, state)              # raises PlannerError if anything is wrong
     return plan
 
@@ -202,27 +232,20 @@ def check_plan(plan: Plan, state) -> None:
     # it down. Each object starts at its scene position.
     object_pos = {label: obj.position for label, obj in objects.items()}
     by_id = {s.id: s for s in plan.steps}
-    print(f"[PLANNER 4/4] CHECKING PLAN (execution order: {order})")
     for sid in order:
         s = by_id[sid]
         arm = arms[s.arm]
         pick_pos = object_pos[s.object_name]      # wherever the object is right now
         drop_pos = places[s.place_at]
-        pick_d = _planar_distance(arm.base_position, pick_pos)
-        drop_d = _planar_distance(arm.base_position, drop_pos)
-        print(f"  {s.id}: {s.arm} (reach={arm.reach:.2f}) "
-              f"pick {s.object_name}@{tuple(round(v,2) for v in pick_pos)} dist={pick_d:.2f} -> "
-              f"drop {s.place_at}@{tuple(round(v,2) for v in drop_pos)} dist={drop_d:.2f}")
-        if pick_d > arm.reach:
+        if _planar_distance(arm.base_position, pick_pos) > arm.reach:
             raise PlannerError(
                 f"step {s.id}: {s.arm} cannot reach object {s.object_name} "
                 f"at {tuple(round(v,2) for v in pick_pos)}")
-        if drop_d > arm.reach:
+        if _planar_distance(arm.base_position, drop_pos) > arm.reach:
             raise PlannerError(
                 f"step {s.id}: {s.arm} cannot reach location {s.place_at} "
                 f"at {tuple(round(v,2) for v in drop_pos)}")
         object_pos[s.object_name] = drop_pos      # object is now at the drop location
-    print("[PLANNER 4/4] all checks passed.")
 
 
 def _order_by_dependencies(steps) -> List[str]:
@@ -244,34 +267,24 @@ def _order_by_dependencies(steps) -> List[str]:
     return ordered
 
 
-def make_plan(state) -> Plan:
+def make_plan(state, image_b64: Optional[str] = None) -> Plan:
     """Ask the model to plan, and return the checked Plan.
 
     This is the function the rest of the system calls. It fails loudly (PlannerError)
     if the model cannot be reached or its reply does not make sense, rather than
     guessing, so a bad attempt is always visible and can be retried.
+
+    If image_b64 (a base64 RGB frame) is given, the model plans from text + image (the
+    VLM condition); if not, it plans from text only (the floor). Same model either way.
     """
-    messages = write_prompt(state)
-
-    print("\n" + "=" * 68)
-    print("[PLANNER 1/4] PROMPT SENT TO MODEL")
-    print(f"  endpoint={QWEN_ENDPOINT}  model={QWEN_MODEL}")
-    print("=" * 68)
-    for m in messages:
-        print(f"[{m['role']}]\n{m['content']}\n")
-
-    print("=" * 68)
-    print("[PLANNER 2/4] CALLING MODEL ...")
-    print("=" * 68)
+    messages = write_prompt(state, image_b64=image_b64)
     try:
         reply = ask_model(messages)
     except Exception as e:
         raise PlannerError(f"the model call failed: {e}") from e
-    print("[PLANNER 2/4] RAW MODEL REPLY:")
-    print(reply)
-    print("=" * 68)
-
-    return read_plan_from_reply(reply, state)   # raises PlannerError if the plan is bad
+    plan = read_plan_from_reply(reply, state)   # raises PlannerError if the plan is bad
+    plan.made_by = "vlm" if image_b64 is not None else "text_llm"
+    return plan
 
 
 def ordered_steps(plan: Plan) -> List[Step]:

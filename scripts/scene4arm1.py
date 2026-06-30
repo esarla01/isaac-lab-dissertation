@@ -568,17 +568,20 @@ def hold_viewer(sim, scene, arms):
             arm._update_carried()
 
 
-def capture_top_view(scene, sim, path=None, warmup=15):
+def capture_top_view(scene, sim, path=None, warmup=15, return_b64=False):
     """Render the top-down camera and save one RGB frame to a PNG file.
 
     Renders a few warmup steps first so the image is valid (the first frames after a
     scene change can be blank), then reads the camera's rgb output, converts it to a
-    uint8 image, and saves it. Returns the path written.
+    uint8 image, and saves it. Returns the path written, or (path, base64_png) if
+    return_b64 is True (the base64 string is what the VLM condition sends to the model).
 
     This both proves the camera works and gives you a way to SEE the scene, since the
     live GLFW window cannot open on this headless launchable. It is also the exact
     frame the VLM condition will send to the model.
     """
+    import io
+    import base64
     import numpy as np
 
     sim_dt = sim.get_physics_dt()
@@ -602,16 +605,23 @@ def capture_top_view(scene, sim, path=None, warmup=15):
         os.makedirs("captures", exist_ok=True)
         path = os.path.join("captures", f"table_{datetime.now():%Y%m%d_%H%M%S}.png")
 
+    b64 = None
     try:
         from PIL import Image
-        Image.fromarray(arr).save(path)
+        img = Image.fromarray(arr)
+        img.save(path)
         print(f"[CAMERA] saved top-down frame to {path}  (shape {arr.shape})")
+        if return_b64:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     except Exception as e:
         np.save(path.replace(".png", ".npy"), arr)
         print(f"[CAMERA] PIL not available ({e}); saved raw array to "
               f"{path.replace('.png', '.npy')}  (shape {arr.shape})")
         path = path.replace(".png", ".npy")
-    return path
+
+    return (path, b64) if return_b64 else path
 
 
 def place_objects(scene, sim, start_positions):
@@ -683,17 +693,25 @@ TASK_LOCATIONS = {
 }
 
 
-def run_block_relay(sim, scene, arms):
-    """Build the symbolic state, ask Qwen for a plan, and execute it (text loop).
+def run_block_relay(sim, scene, arms, use_image=False):
+    """Build the symbolic state, ask Qwen for a plan, and execute it.
 
-    This is the first end-to-end run of the text-instruction pipeline on four arms:
-    state -> planner (live Qwen) -> execution. No image yet; that is the next step.
+    state -> planner (live Qwen) -> execution. If use_image is False the model plans
+    from the symbolic text only (the floor condition). If True, a top-down frame is
+    captured and sent alongside the same text (the VLM condition). The ONLY difference
+    is whether the image is attached, so modality, not model, is the variable.
     """
     import state as state_mod
     from planner import make_plan, PlannerError, ordered_steps
 
     # Put the block at its start (the fragile look-alike is parked out of the way).
     place_objects(scene, sim, {"cube": BLOCK_START, "fragile": (0.0, 0.55)})
+
+    # For the VLM condition, capture the frame the model will see (also saved to file).
+    image_b64 = None
+    if use_image:
+        _, image_b64 = capture_top_view(scene, sim, return_b64=True)
+        print("[VLM] attached a top-down frame to the planning request")
 
     # Symbolic state over all four arms, the block, and the task's named locations.
     object_specs = {
@@ -710,12 +728,12 @@ def run_block_relay(sim, scene, arms):
 
     # Ask the live model for a plan; fail loudly if it is unreachable or nonsensical.
     try:
-        plan = make_plan(world)
+        plan = make_plan(world, image_b64=image_b64)
     except PlannerError as e:
         print(f"\n[PLANNER] no usable plan: {e}")
         return
 
-    print("\n=== MODEL PLAN ===")
+    print(f"\n=== MODEL PLAN (made_by={plan.made_by}) ===")
     for s in ordered_steps(plan):
         dep = f" after {s.depends_on}" if s.depends_on else ""
         print(f"  {s.id}: {s.arm} moves {s.object_name} -> {s.place_at}{dep}  ({s.reason})")
@@ -723,15 +741,61 @@ def run_block_relay(sim, scene, arms):
     run_plan(plan, scene, sim, arms, label_to_key, TASK_LOCATIONS)
 
 
+def probe_vision(scene, sim):
+    """Diagnostic: send the top-down frame to Qwen and print what it says it sees.
+
+    This is the strong test that the model is ACTUALLY reading the image, not just
+    accepting it: it asks for a description that can only come from the pixels. If the
+    reply matches the saved frame (object count, colours, rough positions), the image
+    is genuinely being processed. It also tells you whether the model can resolve your
+    objects at the current resolution, which feeds the fragility-cue question.
+    """
+    from planner import ask_model
+
+    # Place the two objects in known, clear spots so you can check the model's answer.
+    placements = {"cube": (-0.45, 0.30), "fragile": (0.45, -0.30)}
+    place_objects(scene, sim, placements)
+
+    path, image_b64 = capture_top_view(scene, sim, return_b64=True)
+    print(f"\n[PROBE] compare the model's answer below against the saved frame: {path}")
+
+    question = (
+        "This is an overhead photo of a table with robot arms around it. "
+        "Ignore the arms. Tell me ONLY about the small objects sitting on the table: "
+        "how many are there, what colour each one is, and roughly where each is "
+        "(left or right, top or bottom). Be concise."
+    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            {"type": "text", "text": question},
+        ],
+    }]
+    print("[PROBE] asking the model to describe what it sees...")
+    try:
+        reply = ask_model(messages, max_tokens=300)
+        print("\n=== MODEL'S DESCRIPTION OF THE IMAGE ===")
+        print(reply)
+        print("========================================")
+        print("If this matches the saved frame (two objects, their colours and "
+              "sides),\nthe model is genuinely reading the image.")
+    except Exception as e:
+        print(f"[PROBE] the model call failed: {e}")
+
+
 # ============================ PART 5: MAIN ==================================
 # Run modes. Set MODE below:
-#   "camera"  -> spawn, settle, place the block, and save ONE top-down frame to a
-#                file (proves the camera works; gives you an image to look at).
-#   "motion"  -> spawn, settle, and move each arm in and back (apparatus check).
-#   "relay"   -> spawn, settle, then ask Qwen for a plan to relay a block across the
-#                table and execute it (the text-instruction pipeline, end to end).
+#   "camera"  -> spawn, settle, place both objects, save ONE top-down frame to a file.
+#   "probe"   -> capture a frame and ask Qwen to DESCRIBE what it sees (proves the
+#                model is actually reading the image; check its answer vs the frame).
+#   "motion"  -> spawn, settle, move each arm in and back (apparatus check).
+#   "relay"   -> floor condition: Qwen plans from the symbolic TEXT only, then execute.
+#   "vlm"     -> VLM condition: Qwen plans from the text PLUS a top-down image, then
+#                execute. Same model and text as "relay"; the image is the only change.
 
-MODE = "camera"
+MODE = "vlm"
 
 
 def motion_test(sim, scene, arms):
@@ -777,12 +841,18 @@ def main():
         # (icy cyan, glassy) is distinguishable from the robust cube (solid blue).
         place_objects(scene, sim, {"cube": (-0.45, 0.30), "fragile": (0.45, -0.30)})
         capture_top_view(scene, sim)
+    elif MODE == "probe":
+        print("\n=== Vision probe: does the model actually see the objects? ===")
+        probe_vision(scene, sim)
     elif MODE == "motion":
         print("\n=== Motion test: each arm reaches in and back, one at a time ===")
         motion_test(sim, scene, arms)
     elif MODE == "relay":
-        print("\n=== Block relay: Qwen plans, the arms execute ===")
-        run_block_relay(sim, scene, arms)
+        print("\n=== Block relay (FLOOR: text only): Qwen plans, the arms execute ===")
+        run_block_relay(sim, scene, arms, use_image=False)
+    elif MODE == "vlm":
+        print("\n=== Block relay (VLM: text + image): Qwen plans, the arms execute ===")
+        run_block_relay(sim, scene, arms, use_image=True)
     else:
         print(f"unknown MODE {MODE!r}")
 
